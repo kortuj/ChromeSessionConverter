@@ -529,13 +529,6 @@ namespace ChromeSessionConverter
             sb.AppendLine("    }");
             sb.AppendLine("  });");
             sb.AppendLine("}");
-            sb.AppendLine("    if (!q || u.includes(q) || t.includes(q)) {");
-            sb.AppendLine("      el.style.display = '';");
-            sb.AppendLine("    } else {");
-            sb.AppendLine("      el.style.display = 'none';");
-            sb.AppendLine("    }");
-            sb.AppendLine("  });");
-            sb.AppendLine("}");
             sb.AppendLine("function toggleHistory(btn) {");
             sb.AppendLine("  const list = btn.nextElementSibling;");
             sb.AppendLine("  if (list.style.display === 'block') {");
