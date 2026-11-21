@@ -237,7 +237,7 @@ namespace ChromeSessionConverter
                 }
 
                 IntPtr stmt;
-                string sql = "SELECT url, title, visit_count, last_visit_time FROM urls WHERE url NOT LIKE 'javascript:%' AND length(url) > 0 ORDER BY last_visit_time DESC LIMIT 2000";
+                string sql = "SELECT url, title, visit_count, last_visit_time FROM urls WHERE url NOT LIKE 'javascript:%' AND length(url) > 0 ORDER BY last_visit_time DESC";
                 rc = SqliteNative.sqlite3_prepare16_v2(db, sql, -1, out stmt, IntPtr.Zero);
                 if (rc == 0)
                 {
