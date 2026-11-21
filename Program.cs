@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace ChromeSessionConverter
@@ -26,7 +27,9 @@ namespace ChromeSessionConverter
         public int TabId;
         public int WindowId;
         public int SelectedIndex;
-        public string Status; // "Open", "Closed", "Restored"
+        public string Status; // "Open", "Closed", "Restored", "History"
+        public long VisitCount;
+        public DateTime VisitTime;
         public Dictionary<int, NavigationEntry> Navigations;
 
         public TabInfo(int tabId)
@@ -35,6 +38,8 @@ namespace ChromeSessionConverter
             WindowId = 0;
             SelectedIndex = -1;
             Status = "Open";
+            VisitCount = 0;
+            VisitTime = DateTime.MinValue;
             Navigations = new Dictionary<int, NavigationEntry>();
         }
 
@@ -63,7 +68,7 @@ namespace ChromeSessionConverter
         public string FileName;
         public long FileSize;
         public DateTime LastModified;
-        public string FileType; // Tabs, Session, Apps, Unknown
+        public string FileType; // Tabs, Session, Apps, History, Unknown
         public List<TabInfo> Tabs;
 
         public ParsedSessionFile()
@@ -91,7 +96,20 @@ namespace ChromeSessionConverter
                 int count = 0;
                 foreach (TabInfo t in Tabs)
                 {
-                    if (t.Status != "Open") count++;
+                    if (t.Status == "Closed" || t.Status == "Restored") count++;
+                }
+                return count;
+            }
+        }
+
+        public int HistoryCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (TabInfo t in Tabs)
+                {
+                    if (t.Status == "History") count++;
                 }
                 return count;
             }
@@ -143,6 +161,126 @@ namespace ChromeSessionConverter
             int pad = (4 - (byteLen % 4)) % 4;
             _pos += pad;
             return s;
+        }
+    }
+
+    class SqliteNative
+    {
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_open16", CharSet = CharSet.Unicode)]
+        public static extern int sqlite3_open16(string filename, out IntPtr db);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_close")]
+        public static extern int sqlite3_close(IntPtr db);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_prepare16_v2", CharSet = CharSet.Unicode)]
+        public static extern int sqlite3_prepare16_v2(IntPtr db, string zSql, int nByte, out IntPtr ppStmt, IntPtr pzTail);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_step")]
+        public static extern int sqlite3_step(IntPtr pStmt);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_column_int64")]
+        public static extern long sqlite3_column_int64(IntPtr pStmt, int iCol);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_column_text16")]
+        public static extern IntPtr sqlite3_column_text16(IntPtr pStmt, int iCol);
+
+        [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_finalize")]
+        public static extern int sqlite3_finalize(IntPtr pStmt);
+    }
+
+    class HistoryParser
+    {
+        public static bool IsSqlite(string filePath)
+        {
+            try
+            {
+                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] header = new byte[16];
+                    int r = fs.Read(header, 0, 16);
+                    if (r < 16) return false;
+                    string s = Encoding.ASCII.GetString(header);
+                    return s.StartsWith("SQLite format 3");
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static ParsedSessionFile Parse(string filePath)
+        {
+            ParsedSessionFile result = new ParsedSessionFile();
+            result.FilePath = filePath;
+            FileInfo fi = new FileInfo(filePath);
+            result.FileName = fi.Name;
+            result.FileSize = fi.Length;
+            result.LastModified = fi.LastWriteTime;
+            result.FileType = "History";
+
+            string tmp = Path.GetTempFileName();
+            try
+            {
+                using (FileStream inStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (FileStream outStream = File.Create(tmp))
+                {
+                    inStream.CopyTo(outStream);
+                }
+
+                IntPtr db;
+                int rc = SqliteNative.sqlite3_open16(tmp, out db);
+                if (rc != 0)
+                {
+                    Console.WriteLine("Warning: Could not open SQLite database {0}", fi.Name);
+                    return result;
+                }
+
+                IntPtr stmt;
+                string sql = "SELECT url, title, visit_count, last_visit_time FROM urls WHERE url NOT LIKE 'javascript:%' AND length(url) > 0 ORDER BY last_visit_time DESC LIMIT 2000";
+                rc = SqliteNative.sqlite3_prepare16_v2(db, sql, -1, out stmt, IntPtr.Zero);
+                if (rc == 0)
+                {
+                    DateTime epoch = new DateTime(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                    int tabId = 1;
+                    while (SqliteNative.sqlite3_step(stmt) == 100) // SQLITE_ROW
+                    {
+                        IntPtr pUrl = SqliteNative.sqlite3_column_text16(stmt, 0);
+                        IntPtr pTitle = SqliteNative.sqlite3_column_text16(stmt, 1);
+                        long visitCount = SqliteNative.sqlite3_column_int64(stmt, 2);
+                        long timeMicros = SqliteNative.sqlite3_column_int64(stmt, 3);
+
+                        string url = pUrl != IntPtr.Zero ? Marshal.PtrToStringUni(pUrl) : string.Empty;
+                        string title = pTitle != IntPtr.Zero ? Marshal.PtrToStringUni(pTitle) : string.Empty;
+                        DateTime visitTime = timeMicros > 0 ? epoch.AddTicks(timeMicros * 10).ToLocalTime() : DateTime.MinValue;
+
+                        TabInfo tab = new TabInfo(tabId++);
+                        tab.Status = "History";
+                        tab.VisitCount = visitCount;
+                        tab.VisitTime = visitTime;
+
+                        NavigationEntry nav = new NavigationEntry();
+                        nav.Index = 0;
+                        nav.Url = url;
+                        nav.Title = title;
+                        tab.Navigations[0] = nav;
+
+                        result.Tabs.Add(tab);
+                    }
+                    SqliteNative.sqlite3_finalize(stmt);
+                }
+                SqliteNative.sqlite3_close(db);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error parsing History SQLite database {0}: {1}", fi.Name, ex.Message);
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+
+            return result;
         }
     }
 
@@ -346,11 +484,13 @@ namespace ChromeSessionConverter
             int totalTabs = 0;
             int totalOpen = 0;
             int totalClosed = 0;
+            int totalHistory = 0;
             foreach (ParsedSessionFile f in files)
             {
                 totalTabs += f.Tabs.Count;
                 totalOpen += f.OpenCount;
                 totalClosed += f.ClosedCount;
+                totalHistory += f.HistoryCount;
             }
 
             StringBuilder sb = new StringBuilder();
@@ -384,6 +524,7 @@ namespace ChromeSessionConverter
             sb.AppendLine("  .badge { background: #e8f0fe; color: #1a73e8; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }");
             sb.AppendLine("  .badge-session { background: #fef7e0; color: #b06000; }");
             sb.AppendLine("  .badge-apps { background: #e6f4ea; color: #137333; }");
+            sb.AppendLine("  .badge-history { background: #f3e8fd; color: #7b1fa2; }");
             sb.AppendLine("  .file-meta { color: #70757a; font-size: 13px; }");
             sb.AppendLine("  ol.tab-list { list-style-position: inside; padding: 0; }");
             sb.AppendLine("  li.tab-item { padding: 12px 14px; border-radius: 8px; margin-bottom: 6px; background: #fafbfc; border: 1px solid #f1f3f4; transition: background 0.15s, border-color 0.15s; }");
@@ -395,6 +536,7 @@ namespace ChromeSessionConverter
             sb.AppendLine("  .badge-status-open { background: #e6f4ea; color: #137333; border: 1px solid #ceead6; }");
             sb.AppendLine("  .badge-status-closed { background: #fce8e6; color: #c5221f; border: 1px solid #fad2cf; }");
             sb.AppendLine("  .badge-status-restored { background: #e8f0fe; color: #1a73e8; border: 1px solid #d2e3fc; }");
+            sb.AppendLine("  .badge-status-history { background: #f3e8fd; color: #7b1fa2; border: 1px solid #e1bee7; }");
             sb.AppendLine("  .tab-url { display: block; color: #5f6368; font-size: 12px; margin-top: 3px; word-break: break-all; }");
             sb.AppendLine("  .history-toggle { font-size: 11px; color: #70757a; cursor: pointer; margin-top: 6px; display: inline-block; user-select: none; }");
             sb.AppendLine("  .history-toggle:hover { color: #1a73e8; }");
@@ -406,14 +548,20 @@ namespace ChromeSessionConverter
             sb.AppendLine("<div class=\"container\">");
             sb.AppendLine("  <header>");
             sb.AppendFormat("    <h1><span>🌐</span> {0}</h1>\n", Escape(title));
-            sb.AppendFormat("    <p class=\"subtitle\">Generated on {0} &bull; Total Files: {1} &bull; Total Tabs: {2} (🟢 {3} Open, 🔴 {4} Closed)</p>\n",
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), files.Count, totalTabs, totalOpen, totalClosed);
+            string subtitle = string.Format("Generated on {0} &bull; Total Files: {1} &bull; Total Entries: {2} (🟢 {3} Open, 🔴 {4} Closed{5})",
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), files.Count, totalTabs, totalOpen, totalClosed,
+                totalHistory > 0 ? (", ⏱️ " + totalHistory + " History") : "");
+            sb.AppendFormat("    <p class=\"subtitle\">{0}</p>\n", subtitle);
             sb.AppendLine("    <div class=\"toolbar\">");
             sb.AppendLine("      <input type=\"text\" id=\"searchBox\" class=\"search-box\" placeholder=\"Filter tabs by title or URL...\" oninput=\"filterTabs()\">");
             sb.AppendLine("      <div class=\"filter-group\">");
             sb.AppendFormat("        <button class=\"filter-btn active\" id=\"filterAll\" onclick=\"setStatusFilter('all')\">All ({0})</button>\n", totalTabs);
             sb.AppendFormat("        <button class=\"filter-btn\" id=\"filterOpen\" onclick=\"setStatusFilter('open')\">🟢 Open ({0})</button>\n", totalOpen);
             sb.AppendFormat("        <button class=\"filter-btn\" id=\"filterClosed\" onclick=\"setStatusFilter('closed')\">🔴 Closed ({0})</button>\n", totalClosed);
+            if (totalHistory > 0)
+            {
+                sb.AppendFormat("        <button class=\"filter-btn\" id=\"filterHistory\" onclick=\"setStatusFilter('history')\">⏱️ History ({0})</button>\n", totalHistory);
+            }
             sb.AppendLine("      </div>");
             sb.AppendLine("      <button class=\"btn btn-outline\" onclick=\"copyAllUrls()\">📋 Copy URLs</button>");
             sb.AppendLine("      <button class=\"btn\" onclick=\"openAllVisible()\">🚀 Open Visible</button>");
@@ -425,17 +573,29 @@ namespace ChromeSessionConverter
                 string badgeClass = "badge";
                 if (file.FileType == "Session") badgeClass = "badge badge-session";
                 else if (file.FileType == "Apps") badgeClass = "badge badge-apps";
+                else if (file.FileType == "History") badgeClass = "badge badge-history";
+
+                string metaText;
+                if (file.FileType == "History")
+                {
+                    metaText = string.Format("{0} history entries &bull; Modified: {1} &bull; Size: {2:N0} bytes",
+                        file.Tabs.Count, file.LastModified.ToString("yyyy-MM-dd HH:mm:ss"), file.FileSize);
+                }
+                else
+                {
+                    metaText = string.Format("{0} tabs (🟢 {1} open, 🔴 {2} closed) &bull; Modified: {3} &bull; Size: {4:N0} bytes",
+                        file.Tabs.Count, file.OpenCount, file.ClosedCount, file.LastModified.ToString("yyyy-MM-dd HH:mm:ss"), file.FileSize);
+                }
 
                 sb.AppendLine("  <div class=\"file-card\">");
                 sb.AppendLine("    <div class=\"file-header\">");
                 sb.AppendFormat("      <div class=\"file-title\">{0} <span class=\"{1}\">{2}</span></div>\n", Escape(file.FileName), badgeClass, Escape(file.FileType));
-                sb.AppendFormat("      <div class=\"file-meta\">{0} tabs (🟢 {1} open, 🔴 {2} closed) &bull; Modified: {3} &bull; Size: {4:N0} bytes</div>\n",
-                    file.Tabs.Count, file.OpenCount, file.ClosedCount, file.LastModified.ToString("yyyy-MM-dd HH:mm:ss"), file.FileSize);
+                sb.AppendFormat("      <div class=\"file-meta\">{0}</div>\n", metaText);
                 sb.AppendLine("    </div>");
 
                 if (file.Tabs.Count == 0)
                 {
-                    sb.AppendLine("    <div class=\"empty-msg\">No active tabs decoded from this file.</div>");
+                    sb.AppendLine("    <div class=\"empty-msg\">No active tabs or entries decoded from this file.</div>");
                 }
                 else
                 {
@@ -458,6 +618,12 @@ namespace ChromeSessionConverter
                         {
                             statusClass = "badge-status badge-status-restored";
                             statusText = "🔄 Restored";
+                        }
+                        else if (tab.Status == "History")
+                        {
+                            statusClass = "badge-status badge-status-history";
+                            string timeStr = tab.VisitTime > DateTime.MinValue ? tab.VisitTime.ToString("yyyy-MM-dd HH:mm") : "History";
+                            statusText = "⏱️ " + timeStr + (tab.VisitCount > 1 ? (" (" + tab.VisitCount + " visits)") : "");
                         }
 
                         sb.AppendFormat("      <li class=\"tab-item\" data-url=\"{0}\" data-title=\"{1}\" data-status=\"{2}\">\n",
@@ -496,9 +662,8 @@ namespace ChromeSessionConverter
             sb.AppendLine("function setStatusFilter(status) {");
             sb.AppendLine("  currentStatusFilter = status;");
             sb.AppendLine("  document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));");
-            sb.AppendLine("  if (status === 'all') document.getElementById('filterAll').classList.add('active');");
-            sb.AppendLine("  else if (status === 'open') document.getElementById('filterOpen').classList.add('active');");
-            sb.AppendLine("  else if (status === 'closed') document.getElementById('filterClosed').classList.add('active');");
+            sb.AppendLine("  const btn = document.getElementById('filter' + status.charAt(0).toUpperCase() + status.slice(1));");
+            sb.AppendLine("  if (btn) btn.classList.add('active');");
             sb.AppendLine("  filterTabs();");
             sb.AppendLine("}");
             sb.AppendLine("function filterTabs() {");
@@ -514,6 +679,8 @@ namespace ChromeSessionConverter
             sb.AppendLine("      matchesStatus = (s === 'open');");
             sb.AppendLine("    } else if (currentStatusFilter === 'closed') {");
             sb.AppendLine("      matchesStatus = (s === 'closed' || s === 'restored');");
+            sb.AppendLine("    } else if (currentStatusFilter === 'history') {");
+            sb.AppendLine("      matchesStatus = (s === 'history');");
             sb.AppendLine("    }");
             sb.AppendLine("    if (matchesQuery && matchesStatus) {");
             sb.AppendLine("      el.style.display = '';");
@@ -582,7 +749,7 @@ namespace ChromeSessionConverter
         static void Main(string[] args)
         {
             Console.WriteLine("=================================================");
-            Console.WriteLine("   Chrome Sessions & Tabs to HTML Converter      ");
+            Console.WriteLine("   Chrome Sessions, Tabs & History Converter     ");
             Console.WriteLine("=================================================");
             Console.WriteLine();
 
@@ -618,7 +785,7 @@ namespace ChromeSessionConverter
             if (File.Exists(inputPath))
             {
                 filesToProcess.Add(inputPath);
-                reportTitle = "Chrome Session - " + Path.GetFileName(inputPath);
+                reportTitle = "Chrome - " + Path.GetFileName(inputPath);
                 if (string.IsNullOrEmpty(outputPath))
                 {
                     outputPath = Path.ChangeExtension(inputPath, ".html");
@@ -626,14 +793,16 @@ namespace ChromeSessionConverter
             }
             else
             {
-                reportTitle = "Chrome Sessions & Tabs Report";
+                reportTitle = "Chrome Sessions, Tabs & History Report";
                 string[] files = Directory.GetFiles(inputPath, "*", SearchOption.TopDirectoryOnly);
                 foreach (string f in files)
                 {
                     string fname = Path.GetFileName(f);
                     if (fname.StartsWith("Session_", StringComparison.OrdinalIgnoreCase) ||
                         fname.StartsWith("Tabs_", StringComparison.OrdinalIgnoreCase) ||
-                        fname.StartsWith("Apps_", StringComparison.OrdinalIgnoreCase))
+                        fname.StartsWith("Apps_", StringComparison.OrdinalIgnoreCase) ||
+                        fname.Equals("History", StringComparison.OrdinalIgnoreCase) ||
+                        fname.StartsWith("History_", StringComparison.OrdinalIgnoreCase))
                     {
                         filesToProcess.Add(f);
                     }
@@ -650,7 +819,7 @@ namespace ChromeSessionConverter
 
             if (filesToProcess.Count == 0)
             {
-                Console.WriteLine("No Chrome Session, Tabs, or Apps files found in: {0}", inputPath);
+                Console.WriteLine("No Chrome Session, Tabs, Apps, or History files found in: {0}", inputPath);
                 PauseIfConsole();
                 return;
             }
@@ -661,8 +830,17 @@ namespace ChromeSessionConverter
             foreach (string file in filesToProcess)
             {
                 Console.WriteLine(" -> Parsing {0}...", Path.GetFileName(file));
-                ParsedSessionFile parsed = SnssParser.Parse(file);
-                Console.WriteLine("    Type: {0}, Decoded Tabs: {1} (Open: {2}, Closed: {3})", parsed.FileType, parsed.Tabs.Count, parsed.OpenCount, parsed.ClosedCount);
+                ParsedSessionFile parsed;
+                if (HistoryParser.IsSqlite(file))
+                {
+                    parsed = HistoryParser.Parse(file);
+                    Console.WriteLine("    Type: History, Entries: {0}", parsed.Tabs.Count);
+                }
+                else
+                {
+                    parsed = SnssParser.Parse(file);
+                    Console.WriteLine("    Type: {0}, Decoded Tabs: {1} (Open: {2}, Closed: {3})", parsed.FileType, parsed.Tabs.Count, parsed.OpenCount, parsed.ClosedCount);
+                }
                 parsedFiles.Add(parsed);
             }
 
