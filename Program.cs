@@ -445,24 +445,9 @@ namespace ChromeSessionConverter
 
             if (string.IsNullOrEmpty(inputPath))
             {
-                // Auto-detect default Chrome Sessions folder
-                string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string defaultSessionsPath = Path.Combine(localAppData, @"Google\Chrome\User Data\Default\Sessions");
-                if (Directory.Exists(defaultSessionsPath))
-                {
-                    Console.WriteLine("Found Chrome default Sessions directory:");
-                    Console.WriteLine("  " + defaultSessionsPath);
-                    inputPath = defaultSessionsPath;
-                }
-                else
-                {
-                    Console.Write("Enter path to Chrome session file or Sessions folder: ");
-                    inputPath = Console.ReadLine();
-                    if (!string.IsNullOrEmpty(inputPath))
-                    {
-                        inputPath = inputPath.Trim().Trim('\"');
-                    }
-                }
+                inputPath = Directory.GetCurrentDirectory();
+                Console.WriteLine("Using current directory by default:");
+                Console.WriteLine("  " + inputPath);
             }
 
             if (string.IsNullOrEmpty(inputPath) || (!File.Exists(inputPath) && !Directory.Exists(inputPath)))
@@ -504,7 +489,7 @@ namespace ChromeSessionConverter
 
                 if (string.IsNullOrEmpty(outputPath))
                 {
-                    outputPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Chrome_Sessions_Report.html");
+                    outputPath = Path.Combine(inputPath, "Chrome_Sessions_Report.html");
                 }
             }
 
